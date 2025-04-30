@@ -22,6 +22,12 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int yield(void);
+int setpriority(int, int);
+int getlev(void);
+int fcfsmode(void);
+int mlfqmode(void);
+
 
 // ulib.c
 int stat(const char*, struct stat*);

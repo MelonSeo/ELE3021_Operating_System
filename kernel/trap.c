@@ -9,6 +9,8 @@
 struct spinlock tickslock;
 uint ticks;
 
+extern int global_ticks;
+
 extern char trampoline[], uservec[], userret[];
 
 // in kernelvec.S, calls kerneltrap().
@@ -72,14 +74,15 @@ usertrap(void)
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
     setkilled(p);
   }
-
   if(killed(p))
-    exit(-1);
+  exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
-
+  if(which_dev == 2) {
+    if(mycpu()->sched_mode == MLFQ) {
+      yield();
+    }
+  }
   usertrapret();
 }
 
@@ -149,11 +152,12 @@ kerneltrap()
     printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
     panic("kerneltrap");
   }
-
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2 && myproc() != 0)
-    yield();
-
+  if(which_dev == 2 && myproc() != 0) {
+    if(mycpu()->sched_mode == MLFQ) {
+      yield();
+    }
+  }
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
   w_sepc(sepc);
@@ -166,6 +170,7 @@ clockintr()
   if(cpuid() == 0){
     acquire(&tickslock);
     ticks++;
+    global_ticks++;
     wakeup(&ticks);
     release(&tickslock);
   }

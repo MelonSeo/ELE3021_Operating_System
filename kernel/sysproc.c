@@ -6,6 +6,8 @@
 #include "spinlock.h"
 #include "proc.h"
 
+extern int global_ticks;
+
 uint64
 sys_exit(void)
 {
@@ -90,4 +92,45 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_yield(void)
+{
+  yield();
+  return 0;
+}
+
+uint64
+sys_getlev(void)
+{
+  // FCFS - 99, MLFQ - Q lev
+  if(mycpu()->sched_mode == FCFS) {
+    return 99;
+  } else {
+    struct proc *p = myproc();
+    return p->level;
+  }
+}
+
+uint64
+sys_setpriority(void)
+{
+  int pid;
+  int priority;
+  argint(0, &pid); 
+  argint(1, &priority);
+  return setpriority(pid, priority);
+}
+
+uint64
+sys_fcfsmode(void)
+{
+  return fcfsmode();
+}
+
+uint64
+sys_mlfqmode(void)
+{
+  return mlfqmode();
 }

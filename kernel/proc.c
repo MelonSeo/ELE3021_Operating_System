@@ -6,6 +6,7 @@
 #include "proc.h"
 #include "defs.h"
 
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -14,6 +15,7 @@ struct proc *initproc;
 
 int nextpid = 1;
 struct spinlock pid_lock;
+int global_ticks = 0;
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
@@ -25,6 +27,90 @@ extern char trampoline[]; // trampoline.S
 // memory model when using p->parent.
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
+
+struct circular_queue mlfq[3];
+
+void
+queueinit(struct circular_queue *cq, int level) 
+{
+  cq->front = 0;
+  cq->rear = 0;
+  cq->size = 0;
+  cq->level = level;
+  if(level == 0) cq->timequantum = L0_TQ;
+  else if (level == 1) cq->timequantum = L1_TQ;
+  else cq->timequantum = L2_TQ;
+}
+
+void
+mlfqinit(void) 
+{
+  for(int i =0; i < 3; i++)
+    queueinit(&mlfq[i], i);
+}
+
+void //해당 proc 넣기
+cq_push(struct proc *p) 
+{
+  int l = p->level;
+  if(mlfq[l].size == NPROC) return;
+  mlfq[l].q[mlfq[l].rear] = p;
+  mlfq[l].rear = (mlfq[l].rear + 1) % NPROC;
+  mlfq[l].size++;
+}
+
+struct proc* //해당 proc 꺼내기
+cq_ppop(struct circular_queue *cq, struct proc *p)
+{
+  if(cq->size == 0) return 0;
+  for (int i = cq->front; i != cq->rear; i = (i + 1) % NPROC) {
+    if(cq->q[i] == p) {
+      for(int j = i; j != cq->rear; j = (j + 1) % NPROC) {
+        cq->q[j] = cq->q[(j+1) % NPROC];
+      }
+      cq->rear = (cq->rear + NPROC - 1) % NPROC;
+      cq->size--;
+      break;
+    }
+  }
+  return 0;
+}
+
+struct proc* //front pop
+cq_pop(struct circular_queue *cq) {
+  if (cq->size == 0) return 0;
+  struct proc *p = 0;
+  p = cq->q[cq->front];
+  cq->front = (cq->front + 1) % NPROC;
+  cq->size--;
+  return p; 
+}
+
+void
+priority_boost(void) {
+  int size_1 = mlfq[1].size;
+  int size_2 = mlfq[2].size;
+  struct proc* p;
+  for (int i = 0; i < size_1; i++) {
+    p = cq_pop(&mlfq[1]);
+    p->level = 0;
+    p->tick = 0;
+    p->priority = 3;
+    cq_push(p);
+  }
+  for (int i = 0; i < size_2; i++) {
+    p = cq_pop(&mlfq[2]);
+    p->level = 0;
+    p->tick = 0;
+    p->priority = 3;
+    cq_push(p);
+  }
+  for (int i = 1; i < 3; i++) {
+    mlfq[i].size = 0;
+    mlfq[i].rear = 0;
+    mlfq[i].front = 0;
+  }
+}
 
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
@@ -124,6 +210,17 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+
+  if (mycpu()->sched_mode == MLFQ) {
+    p->level = 0;
+    p->priority = 3;
+    p->tick = 0;
+  }
+  else {
+    p->level = -1;
+    p->priority = -1;
+    p->tick = -1;
+  }
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -250,6 +347,9 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+  if(mycpu()->sched_mode == MLFQ) {
+    cq_push(p);
+  }
 
   release(&p->lock);
 }
@@ -320,6 +420,9 @@ fork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  if(mycpu()->sched_mode == MLFQ) {
+    cq_push(np);
+  }
   release(&np->lock);
 
   return pid;
@@ -446,40 +549,160 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
+  struct proc *selected = 0;
+  struct proc *next_proc = 0;
+  c->sched_mode = FCFS;
 
   c->proc = 0;
+  mlfqinit();
   for(;;){
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
     // processes are waiting.
     intr_on();
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
+    if (c->sched_mode == MLFQ && global_ticks >= 50) {
+      priority_boost();
+      global_ticks = 0;
+    }
+
+    if(c->sched_mode == FCFS) {
+      selected = 0;
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          if(selected == 0 || p->pid < selected->pid) {
+            if(selected)
+              release(&selected->lock);
+            selected = p;
+            continue;
+          }
+        }
+        release(&p->lock);
+      }
+    
+
+    if(selected) {
+      selected->state = RUNNING;
+      c->proc = selected;
+      swtch(&c->context, &selected->context);
+      c->proc = 0;
+      release(&selected->lock);
+    }
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
-    }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    else {
       intr_on();
       asm volatile("wfi");
+        // nothing to run; stop running on this core until an interrupt.
+    }      
+  } else { //MLFQ
+      next_proc = 0;
+      next_proc = cq_pop(&mlfq[0]);
+
+      if(!next_proc) next_proc = cq_pop(&mlfq[1]);
+
+      if (!next_proc) {
+      int max_priority = -1;
+      for (int i = 0; i < mlfq[2].size && next_proc == 0; i++) {
+        p = mlfq[2].q[i];
+        if(max_priority < p->priority) {
+          max_priority = p->priority;
+          next_proc = p;
+          }
+        }
+        cq_ppop(&mlfq[2], next_proc);
+      } 
+
+      if (next_proc) {
+        acquire(&next_proc->lock);
+        next_proc->state = RUNNING;
+        c->proc = next_proc;
+        swtch(&c->context, &next_proc->context);
+        c->proc = 0;
+        release(&next_proc->lock);
+      }
+      else {
+        intr_on();
+        asm volatile("wfi");
+          // nothing to run; stop running on this core until an interrupt.
+      }
     }
   }
 }
 
+int
+setpriority(int pid, int priority) {
+  if(priority < 0 && priority > 3) {
+    return -2;
+  }
+
+  struct proc *p;
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->pid == pid){
+      p->priority = priority;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
+int
+fcfsmode(void) {
+  struct proc *p;
+  struct cpu *c = mycpu();
+  
+  if(c->sched_mode == FCFS) {
+    printf("Already in FCFS mode\n");
+    return -1;
+  }
+
+  c->sched_mode = FCFS;
+  global_ticks = 0;
+  
+  // 모든 프로세스의 MLFQ 관련 변수 초기화
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == RUNNABLE || p->state == RUNNING || p->state == SLEEPING) {
+      p->priority = -1;
+      p->level = -1;
+      p->tick = -1;
+    }
+    release(&p->lock);
+  }
+  return 0;
+}
+
+int
+mlfqmode(void) {
+  struct proc *p;
+  struct cpu *c = mycpu();
+  if(c->sched_mode == MLFQ) {
+    printf("Already in MFLQ\n");
+    return -1;
+  }
+  else {
+    c->sched_mode = MLFQ;
+    global_ticks = 0;
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+        p->priority = 3;
+        p->level = 0;
+        p->tick = 0;
+        if(p->state == RUNNABLE)
+          cq_push(p);
+      release(&p->lock);
+    }
+  }
+  return 0;
+}
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
 // intena because intena is a property of this
@@ -514,6 +737,19 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  if(mycpu()->sched_mode == MLFQ) {
+    //context switch 이후 timequantum 증가
+    if(++p->tick >= 2*p->level + 1) {
+      if(p->level < 2) {
+        p->level++;
+        p->tick = 0;
+      } //L2라면 priority 감소
+      if(p->level == 2 && p->priority > 0) {
+        p->priority--;
+      }
+    }
+    cq_push(p);
+  }
   sched();
   release(&p->lock);
 }
@@ -562,6 +798,18 @@ sleep(void *chan, struct spinlock *lk)
   // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
+  if(mycpu()->sched_mode == MLFQ) {
+    //context switch 이후 timequantum 증가
+    if(++p->tick >= 2*p->level + 1) {
+      if(p->level < 2) {
+        p->level++;
+        p->tick = 0;
+      } //L2라면 priority 감소
+      if(p->level == 2 && p->priority > 0) {
+        p->priority--;
+      }
+    }
+  }
 
   sched();
 
@@ -585,6 +833,9 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        if (mycpu()->sched_mode == MLFQ) {
+          cq_push(p);
+        }
       }
       release(&p->lock);
     }
@@ -606,6 +857,9 @@ kill(int pid)
       if(p->state == SLEEPING){
         // Wake process from sleep().
         p->state = RUNNABLE;
+        if(mycpu()->sched_mode == MLFQ) {
+          cq_push(p);
+        }
       }
       release(&p->lock);
       return 0;

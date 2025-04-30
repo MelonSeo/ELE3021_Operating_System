@@ -1,3 +1,14 @@
+#include "param.h"
+
+#define FCFS 0
+#define MLFQ 1
+
+#define L0_TQ 1
+#define L1_TQ 3
+#define L2_TQ 5
+
+#define BOOST_TICKS 50
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -24,6 +35,7 @@ struct cpu {
   struct context context;     // swtch() here to enter scheduler().
   int noff;                   // Depth of push_off() nesting.
   int intena;                 // Were interrupts enabled before push_off()?
+  int sched_mode;
 };
 
 extern struct cpu cpus[NCPU];
@@ -104,4 +116,18 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  int level;
+  int priority;
+  int tick;
 };
+
+struct circular_queue {
+  struct proc *q[NPROC];
+  int front;
+  int rear;
+  int size;
+  int level;
+  int timequantum;
+};
+
