@@ -105,4 +105,8 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  int isthread;                //thread == 1
+  void* tstack;                //userstack pointer
+  struct proc* main;           //main thread(process thread leader)
 };

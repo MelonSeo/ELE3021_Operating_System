@@ -18,6 +18,9 @@ struct spinlock pid_lock;
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
+static void freethread(struct proc *t);
+
+
 extern char trampoline[]; // trampoline.S
 
 // helps ensure that wakeups of wait()ing
@@ -124,7 +127,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
-
+  p->isthread = 0;
+  p->main = p;
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -149,6 +153,64 @@ found:
   return p;
 }
 
+static struct proc*
+allocthread(struct proc *main, void *tstack)
+{
+  struct proc *t;
+  int idx = -1;
+
+  for(t = proc; t < &proc[NPROC]; t++) {
+    acquire(&t->lock);
+    if(t->state == UNUSED) {
+      idx = t - proc;
+      goto found;
+    }
+    release(&t->lock);
+  }
+  return 0;
+
+found:
+  t->pid = allocpid();
+  t->state = USED;
+  t->isthread = 1;
+  t->main = main;        // 그룹 리더(메인 스레드) 지정
+  t->tstack = tstack;    // 사용자 스택(유저가 malloc한 주소)
+  t->parent = main->parent; // fork/clone 규칙에 맞게 부모 설정
+
+  // trapframe, 커널 스택, context 등 스레드별 자원 할당
+  if((t->trapframe = (struct trapframe*)kalloc()) == 0) {
+    freethread(t);
+    release(&t->lock);
+    return 0;
+  }
+  memset(t->trapframe, 0, PGSIZE);
+
+  // 커널 스택
+  t->kstack = KSTACK(idx);
+  // context 초기화
+  memset(&t->context, 0, sizeof(t->context));
+  t->context.ra = (uint64)forkret;
+  t->context.sp = t->kstack + PGSIZE;
+
+  // 주소 공간, 파일 디스크립터, cwd 등은 main에서 공유/복사
+  // trappage_va는 thread별로 mapping
+  t->pagetable = main->pagetable; //shared
+  if(mappages(main->pagetable, t->trapframe_va = TRAPFRAME - idx * PGSIZE, PGSIZE, (uint64)t->trapframe, PTE_R | PTE_W) < 0) {
+    return 0;
+  }
+
+  t->sz = main->sz; //복사 grow예외
+  for(int i = 0; i < NOFILE; i++)
+    if(main->ofile[i])
+      t->ofile[i] = filedup(main->ofile[i]);
+  t->cwd = idup(main->cwd);
+
+  safestrcpy(t->name, main->name, sizeof(t->name));
+
+  return t;
+}
+
+
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -171,6 +233,55 @@ freeproc(struct proc *p)
   p->xstate = 0;
   p->state = UNUSED;
 }
+
+// 스레드별 자원만 해제 (커널 스택, trapframe 등)
+// t->lock을 잡은 상태에서 호출해야 함
+static void
+freethread(struct proc *t)
+{
+  //va mapping 해제
+  if(t->pagetable && t->trapframe_va)
+    uvmunmap(t->pagetable, t->trapframe_va, 1, 0);
+  // trapframe 해제
+  if(t->trapframe) {
+    kfree((void*)t->trapframe);
+    t->trapframe = 0;
+    t->trapframe_va = 0;
+  }
+
+  // 커널 스택 해제
+  // 사용자 스택(t->tstack)은 해제X
+  // join에서 user space에서 free로 해제
+
+  //fd 해제
+  for(int fd = 0; fd < NOFILE; fd++) {
+    if(t->ofile[fd]) {
+      fileclose(t->ofile[fd]);
+      t->ofile[fd] = 0;
+    }
+  }
+  if(t->cwd) {
+    begin_op();
+    iput(t->cwd);
+    end_op();
+    t->cwd = 0;
+  }
+
+  // 기타 초기화
+  t->state = UNUSED;
+  t->pid = 0;
+  t->parent = 0;
+  t->main = 0;
+  t->isthread = 0;
+  t->tstack = 0;
+  t->chan = 0;
+  t->killed = 0;
+  t->xstate = 0;
+  t->name[0] = 0;
+  t->pagetable = 0;
+  // pagetable, sz 등은 main thread가 관리
+}
+
 
 // Create a user page table for a given process, with no user memory,
 // but with trampoline and trapframe pages.
@@ -271,7 +382,11 @@ growproc(int n)
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
-  p->sz = sz;
+  for(struct proc *t = proc; t < &proc[NPROC]; t++) {
+      if(t->pagetable == p->pagetable) {
+        t->sz = sz;
+      }
+    }
   return 0;
 }
 
@@ -313,6 +428,9 @@ fork(void)
 
   pid = np->pid;
 
+  np->isthread = 0;
+  np->main = np;
+
   release(&np->lock);
 
   acquire(&wait_lock);
@@ -326,6 +444,33 @@ fork(void)
   return pid;
 }
 
+int
+clone(void(*fcn)(void*, void*), void* arg1, void* arg2, void* stack) {
+  struct proc *np;
+  struct proc *p = myproc();
+
+  //allocthread으로 thread 할당(~= fork)
+  if((np = allocthread(p->isthread ? p->main : p, stack)) == 0)
+    return -1;
+
+ 
+  //trapframe copy
+  *(np->trapframe) = *(p->trapframe);
+  // 
+  np->trapframe->epc = (uint64)fcn;
+  // - a0, a1: 함수 인자
+  np->trapframe->a0 = (uint64)arg1;
+  np->trapframe->a1 = (uint64)arg2;
+  // - sp: 새 스택의 최상단
+  np->trapframe->sp = (uint64)stack + PGSIZE;
+
+  //scheduling
+  int pid = np->pid;
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
 void
@@ -348,11 +493,47 @@ void
 exit(int status)
 {
   struct proc *p = myproc();
-
   if(p == initproc)
     panic("init exiting");
 
-  // Close all open files.
+  // 메인 스레드가 exit()를 호출한 경우: 프로세스 전체 종료
+  if(p->isthread == 0) {
+    // 같은 주소 공간을 공유하는 모든 스레드(자신 제외) 순회
+    for(struct proc *t = proc; t < &proc[NPROC]; t++) {
+      if(t->pagetable == p->pagetable && t->state != ZOMBIE && t != p) {
+        begin_op();
+        iput(t->cwd);
+        end_op();
+        acquire(&t->lock);
+        t->cwd = 0;
+        
+        // t->tstack (user stack)는 해제하지 않음! (join 없이 종료)
+        freethread(t); // 커널 자원 해제
+
+        release(&t->lock);
+      }
+    }
+    // 메인 스레드가 마지막에 parent를 깨움
+    // 열린 파일, cwd 등 자원 해제
+        for(int fd = 0; fd < NOFILE; fd++){
+          if(p->ofile[fd]){
+            struct file *f = p->ofile[fd];
+            fileclose(f);
+            p->ofile[fd] = 0;
+          }
+        }
+    acquire(&wait_lock);
+    reparent(p);
+    wakeup(p->parent);
+    acquire(&p->lock);
+    p->xstate = status;
+    p->state = ZOMBIE;
+    release(&wait_lock);
+    sched();
+    panic("zombie exit");
+  }
+
+  // 서브 스레드가 exit()를 호출한 경우: 자신만 종료(ZOMBIE로 남김)
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
       struct file *f = p->ofile[fd];
@@ -367,24 +548,20 @@ exit(int status)
   p->cwd = 0;
 
   acquire(&wait_lock);
+  // main 깨우기 (join에서 회수)
+  wakeup(p->main);
 
-  // Give any children to init.
-  reparent(p);
-
-  // Parent might be sleeping in wait().
-  wakeup(p->parent);
-  
   acquire(&p->lock);
 
   p->xstate = status;
   p->state = ZOMBIE;
 
   release(&wait_lock);
-
-  // Jump into the scheduler, never to return.
+  
   sched();
   panic("zombie exit");
 }
+
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
@@ -415,7 +592,8 @@ wait(uint64 addr)
             release(&wait_lock);
             return -1;
           }
-          freeproc(pp);
+          pp->isthread ? freethread(pp) : freeproc(pp);
+          //freeproc(pp);
           release(&pp->lock);
           release(&wait_lock);
           return pid;
@@ -434,6 +612,49 @@ wait(uint64 addr)
     sleep(p, &wait_lock);  //DOC: wait-sleep
   }
 }
+
+int 
+join(void **stack)
+{
+  struct proc *p = myproc();
+  struct proc *t;
+  int havekids;
+
+  acquire(&wait_lock);
+  for(;;) {
+    havekids = 0;
+    for(t = proc; t < &proc[NPROC]; t++) {
+      // 같은 main_thread(스레드 그룹) && 스레드(메인 제외)만 대상
+      if(t->main == p->main && t->isthread) {
+        acquire(&t->lock);
+        havekids = 1;
+        if(t->state == ZOMBIE) {
+          // 스택 주소 복사 (유저 공간)
+          if(stack != 0 &&
+             copyout(p->pagetable, (uint64)stack, (char *)&t->tstack, sizeof(void *)) < 0) {
+            release(&t->lock);
+            release(&wait_lock);
+            return -1;
+          }
+          int pid = t->pid;
+          freethread(t); // 자원 해제
+          release(&t->lock);
+          release(&wait_lock);
+          return pid;
+        }
+        release(&t->lock);
+      }
+    }
+    // 스레드 그룹 내 자식 스레드가 없거나, 자신이 죽었으면 -1
+    if(!havekids || killed(p)) {
+      release(&wait_lock);
+      return -1;
+    }
+    // 종료된 스레드가 없으면 대기
+    sleep(p, &wait_lock);
+  }
+}
+
 
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
