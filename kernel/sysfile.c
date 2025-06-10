@@ -301,6 +301,29 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
+int
+sys_symlink(void) {
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+  
+  begin_op();
+  ip = create(path, T_SYMLINK, 0, 0);
+  if (ip == 0) {
+    end_op();
+    return -1;
+  }
+  
+  //ilock(ip);
+  writei(ip, 0, (uint64)target, 0, strlen(target) + 1);
+  iunlockput(ip);
+
+  end_op();
+  return 0;
+
+}
+
 uint64
 sys_open(void)
 {
@@ -309,6 +332,7 @@ sys_open(void)
   struct file *f;
   struct inode *ip;
   int n;
+  int depth = 0;
 
   argint(1, &omode);
   if((n = argstr(0, path, MAXPATH)) < 0)
@@ -328,6 +352,29 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+
+    while(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
+      if(++depth > 10) { // 순환 참조 방지
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      char target[MAXPATH];
+      int m = readi(ip, 0, (uint64)target, 0, MAXPATH);
+      iunlockput(ip);
+      if(m <= 0) {
+        end_op();
+        return -1; // broken link
+      }
+      target[MAXPATH-1] = '\0'; // 안전하게 널 종료
+      ip = namei(target);
+      if(ip == 0){
+        end_op();
+        return -1; // broken link
+      }
+      ilock(ip);
+    }
+    
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
